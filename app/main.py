@@ -26,6 +26,7 @@ from .schemas import (
     ReviewSubmissionIn,
     ReviewerIn,
     ReviewerUpdate,
+    SnapshotPublishIn,
 )
 from .solver import Paper, Reviewer, compute_assignment, compute_backfill
 
@@ -512,6 +513,204 @@ def paper_reviews(paper_id: str, _: bool = Depends(require_organizer)):
         "slots": slots,
         "archived_reviews": archived,
     }
+
+
+# ------------------------------------------------ 面向作者的匿名反馈快照
+
+# 无效码/已失效码统一 404, 响应体完全相同, 不透露论文是否存在
+_SNAPSHOT_INVALID_CODE = HTTPException(
+    status_code=404,
+    detail="无效或已失效的访问码 (invalid or expired access code)",
+)
+
+
+def _frozen_review(row):
+    """从评语行冻结对外内容: 仅评分与评语, 不含收据/评审人/时间等内部字段。"""
+    return {"score": row["score"], "comment": row["comment"]}
+
+
+def _snapshot_public(row):
+    """持码者视图: 论文编号 + 按方案槽位固定顺序标号 1、2 的两份评分与评语。"""
+    return {
+        "paper_id": row["paper_id"],
+        "reviews": [
+            {"label": 1, **json.loads(row["review1"])},
+            {"label": 2, **json.loads(row["review2"])},
+        ],
+    }
+
+
+@app.post("/papers/{paper_id}/feedback-snapshot")
+def publish_feedback_snapshot(
+    paper_id: str,
+    body: SnapshotPublishIn,
+    _: bool = Depends(require_organizer),
+):
+    """会务方按论文发布面向作者的匿名反馈快照。
+
+    - 请求须携带当前发布序号 serial: 与当前发布序号不一致 (过期/超前) 即 409;
+      尚未发布 404; 该论文不在当前发布版中 404;
+    - 仅当该序号下两名评审人均已确认且各提交一份正式评语时才允许发布,
+      否则 422 且不写入任何新版本;
+    - 相同发布序号及两份评语收据的重复请求幂等返回原快照与原访问码 (changed=false);
+      来源变化 (补位/重新发布导致序号前进、评语为新收据) 后生成新版本
+      (version+1) 与新随机访问码, 旧码立即失效, 旧版保留仅供会务方追溯。
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    with db.write_txn() as conn:
+        published = _load_published(conn)
+        if published is None:
+            raise HTTPException(status_code=404, detail="尚未发布任何分配方案, 无反馈快照可发布")
+        current_serial = published["serial"]
+        if body.serial != current_serial:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"发布序号已过期: 快照请求针对序号 {body.serial},"
+                    f" 当前发布序号为 {current_serial}, 请按当前发布版重新请求"
+                ),
+            )
+        plan = json.loads(published["plan"])
+        pair = plan.get(paper_id)
+        if not pair:
+            raise HTTPException(
+                status_code=404,
+                detail=f"当前发布版中不存在论文 {paper_id} 的分配, 无法发布快照",
+            )
+        decisions = _load_decisions(conn, current_serial)
+        reviews = _load_reviews(conn, current_serial)
+        slots = [
+            (rid, decisions.get((paper_id, rid)), reviews.get((paper_id, rid)))
+            for rid in pair  # 方案槽位顺序 (评审人编号字典序) 即快照标号 1、2 的固定顺序
+        ]
+        waiting_confirmation = [
+            rid for rid, d, _ in slots if d is None or d["state"] != "confirmed"
+        ]
+        waiting_review = [rid for rid, _, r in slots if r is None]
+        if waiting_confirmation or waiting_review:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "message": (
+                        "两名评审人尚未全部确认并各提交一份正式评语, 快照发布拒绝,"
+                        " 不产生新版本"
+                    ),
+                    "slots": len(slots),
+                    "confirmed": len(slots) - len(waiting_confirmation),
+                    "submitted": len(slots) - len(waiting_review),
+                    "waiting_confirmation": waiting_confirmation,
+                    "waiting_review": waiting_review,
+                },
+            )
+        receipt1, receipt2 = slots[0][2]["receipt"], slots[1][2]["receipt"]
+        existing = conn.execute(
+            "SELECT * FROM feedback_snapshots"
+            " WHERE paper_id = ? AND serial = ? AND receipt1 = ? AND receipt2 = ?",
+            (paper_id, current_serial, receipt1, receipt2),
+        ).fetchone()
+        if existing is not None:
+            return {
+                "ok": True,
+                "paper_id": paper_id,
+                "serial": current_serial,
+                "version": existing["version"],
+                "access_code": existing["access_code"],
+                "changed": False,
+                "snapshot": _snapshot_public(existing),
+            }
+        version = conn.execute(
+            "SELECT COALESCE(MAX(version), 0) + 1 AS v"
+            " FROM feedback_snapshots WHERE paper_id = ?",
+            (paper_id,),
+        ).fetchone()["v"]
+        while True:
+            access_code = f"fbk-{secrets.token_hex(16)}"
+            if conn.execute(
+                "SELECT 1 FROM feedback_snapshots WHERE access_code = ?", (access_code,)
+            ).fetchone() is None:
+                break
+        conn.execute(
+            "INSERT INTO feedback_snapshots"
+            "(paper_id, version, serial, receipt1, receipt2, access_code,"
+            " review1, review2, created_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?)",
+            (
+                paper_id,
+                version,
+                current_serial,
+                receipt1,
+                receipt2,
+                access_code,
+                json.dumps(_frozen_review(slots[0][2]), ensure_ascii=False),
+                json.dumps(_frozen_review(slots[1][2]), ensure_ascii=False),
+                now,
+            ),
+        )
+        row = conn.execute(
+            "SELECT * FROM feedback_snapshots WHERE access_code = ?", (access_code,)
+        ).fetchone()
+    return {
+        "ok": True,
+        "paper_id": paper_id,
+        "serial": current_serial,
+        "version": version,
+        "access_code": access_code,
+        "changed": True,
+        "snapshot": _snapshot_public(row),
+    }
+
+
+@app.get("/feedback-snapshots/{access_code}")
+def read_feedback_snapshot(access_code: str):
+    """持码者读取论文当前有效反馈快照 (无需会务方/评审人凭据)。
+
+    仅返回论文编号与按固定顺序标号 1、2 的两份评分和评语,
+    不暴露评审人编号、机构、收据及任何内部诊断字段。
+    持码者只能读取当前有效快照: 补位或重新发布导致发布序号变化时,
+    旧码立即失效; 无效码、已失效码统一 404, 不透露论文是否存在。
+    """
+    with db.read_txn() as conn:
+        row = conn.execute(
+            "SELECT * FROM feedback_snapshots WHERE access_code = ?", (access_code,)
+        ).fetchone()
+        if row is None:
+            raise _SNAPSHOT_INVALID_CODE
+        published = _load_published(conn)
+        # 快照仅在其发布序号仍为当前发布序号时有效; 发布序号单调递增,
+        # 序号相同即意味着该论文没有更新的快照版本
+        if published is None or published["serial"] != row["serial"]:
+            raise _SNAPSHOT_INVALID_CODE
+        return _snapshot_public(row)
+
+
+@app.get("/papers/{paper_id}/feedback-snapshots")
+def list_feedback_snapshots(paper_id: str, _: bool = Depends(require_organizer)):
+    """会务方追溯某篇论文的全部快照版本 (含已失效旧版及其访问码与评语收据)。"""
+    with db.read_txn() as conn:
+        published = _load_published(conn)
+        current_serial = published["serial"] if published else None
+        rows = conn.execute(
+            "SELECT version, serial, receipt1, receipt2, access_code,"
+            " review1, review2, created_at FROM feedback_snapshots"
+            " WHERE paper_id = ? ORDER BY version",
+            (paper_id,),
+        ).fetchall()
+        versions = [
+            {
+                "version": r["version"],
+                "serial": r["serial"],
+                "access_code": r["access_code"],
+                "active": current_serial == r["serial"],
+                "receipts": [r["receipt1"], r["receipt2"]],
+                "reviews": [
+                    {"label": 1, **json.loads(r["review1"])},
+                    {"label": 2, **json.loads(r["review2"])},
+                ],
+                "created_at": r["created_at"],
+            }
+            for r in rows
+        ]
+    return {"paper_id": paper_id, "current_serial": current_serial, "snapshots": versions}
 
 
 # ---------------------------------------------------------------- 评审人视图
