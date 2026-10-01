@@ -56,3 +56,8 @@ class ReviewSubmissionIn(BaseModel):
     serial: int = Field(ge=1, description="提交所针对的发布序号; 与当前发布序号不一致即过期")
     score: StrictInt = Field(ge=1, le=5, description="1~5 的整数评分")
     comment: str = Field(min_length=1, max_length=10000, description="非空正式评语")
+
+
+class FeedbackSnapshotIn(BaseModel):
+    paper_id: str = Field(min_length=1, max_length=128, description="要发布匿名反馈快照的论文编号")
+    serial: int = Field(ge=1, description="当前发布序号; 过期或超前一律拒绝, 且不产生新版本")

@@ -58,6 +58,26 @@ SQLite 写事务**（`BEGIN IMMEDIATE`）内完成，与资料修改并发不会
 - 评审人仅可查看**本人当前有效任务**上的评语（`GET /reviewer/reviews`），
   看不到另一评审人的评语，响应也不含作者机构。
 
+**面向作者的匿名反馈快照（会务方发布、持码者读取）**：会务方按论文发布一份
+面向作者的匿名反馈快照（`POST /papers/{paper_id}/feedback-snapshots`），
+请求体携带**当前发布序号 `serial`** 与论文编号：
+
+- 仅当该发布版中该论文的**两名评审人均已确认**（`confirmed`）且**各提交一份正式评语**
+  时才能发布；**序号过期/超前**（与当前发布序号不一致）或**资料不齐**一律 `409` 拒绝，
+  被拒请求**不留下新版本**，也不推进资料修订号/发布序号；尚未发布 `404`、
+  当前发布版中无此论文 `404`；
+- 发布成功返回该论文的**随机访问码**（`access_code`，形如 `fbk-…`），
+  由会务方转交持码作者；持码者**无需任何凭据**即可读取
+  （`GET /feedback/{access_code}`），响应**只含论文编号**与按**固定顺序标为 1、2**
+  的两份评分和评语——不暴露评审人编号、机构、评语收据及内部诊断；
+- 持码者**只能读取当前有效快照**：补位发布或重新发布导致发布序号变化后，
+  **旧码立即失效**（统一按无效码 `404` 拒绝）；
+- **幂等**：相同发布序号及两份评语收据的重复请求返回**原快照与原访问码**
+  （`created=false`），不新增版本；**来源变化**（序号变化，或同一序号下评语内容被替换）
+  后再发布必须生成**新版本、新访问码**，**旧版本保留仅供会务方追溯**
+  （`GET /papers/{paper_id}/feedback-snapshots`，含每个版本的 `active` 标记）；
+- **无效码统一 `404`**，错误体不区分论文是否存在。
+
 **补位预演与补位发布**：会务方以**当前发布版 + 当前资料修订号**预演补位
 （`POST /assignment/backfill/dry-run`）：
 
@@ -74,8 +94,9 @@ SQLite 写事务**（`BEGIN IMMEDIATE`）内完成，与资料修改并发不会
 
 | 角色 | 凭据 | 权限 |
 |---|---|---|
-| 会务方 | 本地密钥（请求头 `X-Organizer-Key`） | 维护资料、预演、发布、查询分配与排除原因、按论文查看评审评语与提交进度 |
+| 会务方 | 本地密钥（请求头 `X-Organizer-Key`） | 维护资料、预演、发布、查询分配与排除原因、按论文查看评审评语与提交进度、发布与追溯匿名反馈快照 |
 | 评审人 | 自身凭据（`X-Reviewer-Id` + `X-Reviewer-Credential`） | 对已发布方案中分配给自己的任务确认/回避、读取匿名稿（不含作者机构）、提交并查看本人正式评语 |
+| 持码作者 | 快照随机访问码（路径参数，无需凭据） | 仅读取访问码对应的当前有效匿名反馈快照（论文编号 + 两份评分/评语） |
 
 ## 一键启动（Docker Compose）
 
@@ -142,14 +163,19 @@ Compose 下可用 `ORGANIZER_KEY=xxx PORT=9000 docker compose up -d` 覆盖。
 | POST | `/reviewer/assignments/{paper_id}/decision` | 评审人提交 `{"paper_id","decision":"confirm"|"recuse","reason"?}`；幂等；未分配 `404`，已回避再确认 `409`，空回避原因 `422` |
 | POST | `/reviewer/assignments/{paper_id}/review` | 评审人提交 `{"paper_id","serial","score":1~5整数,"comment"}`；同内容重试返原收据，内容不同 `409`，序号过期/超前 `409`，未分配/已移出 `404`，未确认/已回避 `409`，非法评分/空评语 `422` |
 | GET | `/reviewer/reviews` | 评审人查看本人当前有效任务上已提交的评语（不含他人评语与作者机构） |
+| POST | `/papers/{paper_id}/feedback-snapshots` | 会务方发布匿名反馈快照，请求体 `{"paper_id","serial"}`；两人已确认且各交一份评语才可发布；序号过期/超前或资料不齐 `409`，尚未发布/当前版无此论文 `404`；相同序号+两份评语收据重复请求返原快照原码（`created=false`），来源变化生成新版本新码 |
+| GET | `/papers/{paper_id}/feedback-snapshots` | 会务方追溯该论文的全部快照版本（旧版含原访问码，`active` 标记是否仍为当前序号） |
+| GET | `/feedback/{access_code}` | 持码者读取当前有效快照（无需凭据）：仅论文编号与按 1、2 固定排序的评分/评语；无效或已失效访问码统一 `404` |
 
 ## 调用示例
 
 完整可运行脚本见 [`examples/demo.sh`](examples/demo.sh)（服务启动后执行 `./examples/demo.sh`）；
 确认/回避 + 补位流程见 [`examples/backfill.sh`](examples/backfill.sh)
 （`./examples/backfill.sh`，建议对新库运行）；
-本轮正式评语收集流程见 [`examples/reviews.sh`](examples/reviews.sh)
-（`./examples/reviews.sh`，建议对新库运行）。
+正式评语收集流程见 [`examples/reviews.sh`](examples/reviews.sh)
+（`./examples/reviews.sh`，建议对新库运行）；
+本轮匿名反馈快照发布与持码读取见 [`examples/snapshots.sh`](examples/snapshots.sh)
+（`./examples/snapshots.sh`，建议对新库运行）。
 
 ```bash
 BASE=http://localhost:8000
@@ -241,6 +267,42 @@ curl $BASE/papers/P1/reviews -H "$ORG"
 仅由会务方在该论文的 `archived_reviews`（带原 `serial`）中追溯；同一人后来重新获稿时
 须重新确认并提交新评语（新收据）。
 
+### 本轮用法：面向作者的匿名反馈快照
+
+会务方在两名评审人均已确认并各交一份正式评语后，携带**当前发布序号**发布快照；
+发布返回的随机访问码可转交作者，持码者无需任何凭据读取；补位/重新发布推进序号后旧码立即失效。
+
+```bash
+# 15. 会务方按论文发布匿名反馈快照 (资料不齐或序号过期 -> 409, 不留新版本)
+curl -X POST $BASE/papers/P1/feedback-snapshots -H "$ORG" \
+  -H 'Content-Type: application/json' \
+  -d '{"paper_id": "P1", "serial": S}'
+# -> {"ok":true,"paper_id":"P1","serial":S,"created":true,
+#     "access_code":"fbk-902f23ae12dfa908130f94bb8ae8f43c",
+#     "snapshot":{"paper_id":"P1","reviews":[
+#       {"index":1,"score":4,"comment":"..."},
+#       {"index":2,"score":2,"comment":"..."}]}}
+
+# 16. 相同发布序号及两份评语收据重复请求 -> 原快照与原码 (created=false)
+# 17. 持码者读取当前有效快照 (无需会务方/评审人凭据; 仅论文编号与 1、2 两份评分评语)
+curl $BASE/feedback/fbk-902f23ae12dfa908130f94bb8ae8f43c
+# -> {"paper_id":"P1","reviews":[{"index":1,"score":4,"comment":"..."},
+#                                {"index":2,"score":2,"comment":"..."}]}
+
+# 18. 无效码 / 序号已被补位或重新发布推进 -> 统一 404, 不透露论文是否存在
+#     {"detail":"访问码无效或对应快照已失效 (invalid or expired access code)"}
+
+# 19. 会务方追溯该论文的全部快照版本 (旧版 active=false, 仅供会务方)
+curl $BASE/papers/P1/feedback-snapshots -H "$ORG"
+# -> {"paper_id":"P1","current_serial":S2,
+#     "snapshots":[{"serial":S,"active":false,"access_code":"fbk-...","reviews":[...]},
+#                  {"serial":S2,"active":true,"access_code":"fbk-...","reviews":[...]}]}
+```
+
+评语顺序固定取当前发布方案中该论文评审人对的顺序（编号升序），因此快照中的
+`1`、`2` 两次发布之间保持可复现；发布响应与持码读取响应均不含评审人编号、
+作者机构、评语收据或任何内部诊断字段。
+
 预演响应示例（可行）：
 
 ```json
@@ -277,8 +339,8 @@ curl $BASE/papers/P1/reviews -H "$ORG"
 | 状态码 | 场景 |
 |---|---|
 | 401 | 会务方密钥缺失/错误；评审人凭据缺失/失效 |
-| 404 | 更新/删除不存在的论文或评审人；尚未发布方案；评审人对**未分配给自己/已被移出当前方案**的论文提交决定或评语；会务方查询当前发布版中不存在的论文评语；尚无发布版时补位预演/发布 |
-| 409 | 论文/评审人编号重复；发布携带的修订号已过期（资料已变更）；补位发布携带的资料修订号或发布序号过期；已回避任务再次确认；评语提交携带的发布序号过期/超前；对 `pending`/`recused` 槽位提交评语；同一有效任务已有评语而提交内容不同（冲突） |
+| 404 | 更新/删除不存在的论文或评审人；尚未发布方案；评审人对**未分配给自己/已被移出当前方案**的论文提交决定或评语；会务方查询当前发布版中不存在的论文评语；尚无发布版时补位预演/发布；快照发布时尚未发布或当前发布版中无此论文；**持码者使用无效或已失效（序号已变化）的快照访问码** |
+| 409 | 论文/评审人编号重复；发布携带的修订号已过期（资料已变更）；补位发布携带的资料修订号或发布序号过期；已回避任务再次确认；评语提交携带的发布序号过期/超前；对 `pending`/`recused` 槽位提交评语；同一有效任务已有评语而提交内容不同（冲突）；**反馈快照发布携带的发布序号过期/超前，或该版两名评审人未全部确认并各交一份正式评语** |
 | 422 | 非法容量（非整数、小于 1）、缺字段等参数校验失败；无可行方案时强行发布；回避原因为空；补位预演无法补齐为完整方案时强行补位发布；评分不是 1～5 的整数或评语为空白；路径论文编号与请求体不一致 |
 
 排除/限制原因代码：`same_institution_as_author`（与作者同机构）、`on_reviewer_avoid_list`
@@ -298,16 +360,18 @@ curl $BASE/papers/P1/reviews -H "$ORG"
 
 ```
 app/
-  main.py     # FastAPI 路由、鉴权、发布/补位发布事务、评审人决定与正式评语
+  main.py     # FastAPI 路由、鉴权、发布/补位发布事务、评审人决定与正式评语、匿名反馈快照
   solver.py   # 分配求解器 + 补位求解器（固定位置、容量比例、字典序、部分方案与诊断）
   db.py       # SQLite 连接、schema 初始化/迁移、修订号、发布序号、读写事务
   schemas.py  # 请求体模型与校验
 tests/test_api.py       # 原有接口与求解器测试（含并发发布测试）
 tests/test_backfill.py  # 确认/回避/硬回避/补位预演与发布测试
-tests/test_reviews.py   # 本轮正式评分/评语、收据幂等与冲突、进度与归档、补位沿用测试
+tests/test_reviews.py   # 正式评分/评语、收据幂等与冲突、进度与归档、补位沿用测试
+tests/test_snapshots.py # 本轮匿名反馈快照：发布前置、幂等原码、持码读取、序号失效、追溯测试
 examples/demo.sh        # 端到端 curl 示例（录入 -> 预演 -> 发布 -> 取稿）
 examples/backfill.sh    # 确认/回避 -> 补位预演 -> 双版本复核发布示例
-examples/reviews.sh     # 本轮端到端示例（确认 -> 提交评语 -> 进度查看 -> 补位沿用/归档）
+examples/reviews.sh     # 正式评语端到端示例（确认 -> 提交评语 -> 进度查看 -> 补位沿用/归档）
+examples/snapshots.sh   # 本轮端到端示例（快照发布 -> 持码读取 -> 幂等 -> 序号失效/新版本/追溯）
 Dockerfile / docker-compose.yml
 ```
 

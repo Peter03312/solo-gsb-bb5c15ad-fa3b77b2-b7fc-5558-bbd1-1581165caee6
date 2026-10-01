@@ -9,6 +9,9 @@
 - submitted_reviews 表保存评审人对"当前发布版中已确认且未回避"槽位的正式评分
   与评语 (按发布序号隔离; 每个有效槽位至多一份, 以收据 receipt 标识;
   补位发布时连续保留的确认槽位连同评语一起复制到新序号);
+- feedback_snapshots 表保存会务方面向作者发布的匿名反馈快照
+  (按 论文+发布序号+两份评语收据 幂等; 每份快照发放一个随机访问码,
+  仅当快照序号仍为当前发布序号时访问码有效; 旧版本保留仅供会务方追溯);
 - reviewer_recusals 表保存评审人声明过的硬回避, 后续普通求解与补位都必须遵守;
 - 发布 = 在同一个写事务内 "校验修订号 -> 重算 -> 写入",
   因此与资料修改并发时不会产生基于旧版资料的方案。
@@ -86,6 +89,22 @@ CREATE TABLE IF NOT EXISTS reviewer_recusals (
     created_at       TEXT NOT NULL,
     PRIMARY KEY (reviewer_id, paper_id)
 );
+-- 会务方面向作者发布的匿名反馈快照:
+-- 同一发布序号、同一对评语收据 (按方案槽位固定顺序) 的重复发布幂等返回原快照/原码;
+-- 来源变化 (序号变化, 或同一序号下评语被替换) 产生新版本, 旧行保留供会务方追溯。
+-- access_code 全局唯一, 为快照发放的随机访问码; 读取时仅当 serial 仍是当前
+-- published.serial 时有效, 补位/重新发布推进序号后旧码立即失效。
+CREATE TABLE IF NOT EXISTS feedback_snapshots (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    paper_id     TEXT NOT NULL,
+    serial       INTEGER NOT NULL,
+    receipt1     TEXT NOT NULL,   -- 方案第 1 个槽位 (reviewer_id 较小者) 的评语收据
+    receipt2     TEXT NOT NULL,   -- 方案第 2 个槽位 (reviewer_id 较大者) 的评语收据
+    access_code  TEXT NOT NULL UNIQUE,
+    created_at   TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_feedback_snapshot_source
+    ON feedback_snapshots (paper_id, serial, receipt1, receipt2);
 """
 
 
